@@ -24,7 +24,11 @@ def load_ztf_fp_file(filepath: str, quality_cut: bool = True) -> pd.DataFrame:
     columns = [c.strip() for c in lines[0].split(',')]
     df = pd.read_csv(StringIO(''.join(lines[1:])), sep=r'\s+', header=None, names=columns)
     if quality_cut:
-        df = df[(df['diffimgstatus'] == 1) & (df['procstatus'] == 0)].reset_index(drop=True)
+        df = df[df['diffimgstatus'] == 1].reset_index(drop=True)
+        df = df[df['procstatus'] == 0].reset_index(drop=True)
+        df = df[df['infobitssci'] < 33554432].reset_index(drop=True)
+        df = df[df['scisigpix'] <= 25].reset_index(drop=True)
+        df = df[df['sciinpseeing'] <= 4].reset_index(drop=True)
     return df
 
 
@@ -39,11 +43,6 @@ class ZTF_FP_Extractor():
     @property
     def baseline_window(self) -> Optional[list]:
         return self._baseline_window
-
-    def _apply_quality_cuts(self) -> None:
-        self.df = self.df[self.df['infobitssci'] < 33554432]
-        self.df = self.df[self.df['scisigpix'] <= 25]
-        self.df = self.df[self.df['sciinpseeing'] <= 4]
 
     def _set_flux_ujy_column(self,
                             flux_id: str = 'forcediffimflux',
@@ -114,6 +113,8 @@ class ZTF_FP_Extractor():
                 print(f"Warning: no valid baseline data for {filt}, field {field}, ccdid {ccdid}, qud {qid} — skipping")
                 continue
             baseline_flux, baseline_flux_unc = self.calculate_baseline(y=y_flux[time_mask], yerr=yerr_flux[time_mask])
+            self.df.loc[group_idx, 'baseline_flux'] = baseline_flux
+            self.df.loc[group_idx, 'baseline_flux_unc'] = baseline_flux_unc
             y_corrected = y_flux - baseline_flux
             self.df.loc[group_idx, flux_id + '_corrected'] = y_corrected
             self.df.loc[group_idx, flux_unc_id + '_corrected'] = np.sqrt((baseline_flux_unc)**2.0 + (yerr_flux)**2.0)
