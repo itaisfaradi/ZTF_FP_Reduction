@@ -33,32 +33,25 @@ class ZTF_FP_Extractor():
         self.df = df
         self.name = name
         self._baseline_window: Optional[list] = None
-        self._baseline_mag: Optional[dict[str, float]] = None
+        self._baseline_flux: Optional[dict[str, float]] = None
         self._span = None  # holds SpanSelector reference to prevent GC
 
     @property
     def baseline_window(self) -> Optional[list]:
         return self._baseline_window
 
-    def _set_raw_mag_column(self,
-                            mag_id: str = 'raw_mag',
-                            flux_id: str = 'forcediffimflux',
-                            diff_id: str = 'zpdiff') -> None:
-        self.df[mag_id] = np.where(
-            self.df[flux_id] > 0,
-            self.df[diff_id] - 2.5 * np.log10(self.df[flux_id]),
-            np.nan
-        )
+    def _apply_quality_cuts(self) -> None:
+        self.df = self.df[self.df['infobitssci'] < 33554432]
+        self.df = self.df[self.df['scisigpix'] <= 25]
+        self.df = self.df[self.df['sciinpseeing'] <= 4]
 
-    def _set_raw_magerr_column(self,
-                               magerr_id: str = 'raw_magerr',
-                               flux_id: str = 'forcediffimflux',
-                               unc_id: str = 'forcediffimfluxunc') -> None:
-        self.df[magerr_id] = np.where(
-            self.df[flux_id] > 0,
-            UNC_FACTOR * self.df[unc_id] / self.df[flux_id],
-            np.nan
-        )
+    def _set_flux_ujy_column(self,
+                            flux_id: str = 'forcediffimflux',
+                            unc_id: str = 'forcediffimfluxunc',
+                            zp_id: str = 'zpdiff') -> None:
+        pre_factor = 10 ** ((23.9 - self.df[zp_id]) / 2.5)
+        self.df[flux_id + '_ujy'] = pre_factor * self.df[flux_id]
+        self.df[unc_id + '_ujy'] = pre_factor * self.df[unc_id]
 
     def get_single_filter_df(self,
                              required_filter: str,
@@ -67,14 +60,25 @@ class ZTF_FP_Extractor():
             f"Not a valid filter, must be one of {VALID_FILTERS}"
         return self.df[self.df[filter_id] == required_filter]
 
-    def calculate_baseline(self, y: np.ndarray) -> tuple[float, float]:
-        valid = y[~np.isnan(y)]
-        return np.mean(valid), np.std(valid)
+    def calculate_baseline(self, 
+                           y: np.ndarray, 
+                           yerr:np.ndarray) -> tuple[float, float]:
+        valid = np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
+        y = y[valid]
+        yerr = yerr[valid]
+        weights = 1.0 / (yerr ** 2.0)
+        return (np.sum(y * weights) / np.sum(weights)), (1.0 / np.sqrt(np.sum(weights)))
 
     def mag2flux_ujy(self,
                  mag: np.ndarray) -> np.ndarray:
         return 10**((23.9 - mag) / 2.5)
 
+    def fluximage2fluxujy(self,
+                          zp: np.ndarray,
+                          imageflux: np.ndarray,
+                          imagefluxunc: np.ndarray):
+        pre_factor = 10 ** ((23.9 - zp) / 2.5)
+        return pre_factor * imageflux, pre_factor * imagefluxunc
     
     def flux_ujy2mag(self,
                  flux: np.ndarray) -> np.ndarray:
@@ -82,96 +86,123 @@ class ZTF_FP_Extractor():
 
     def correct_baseline(self,
                          time_window: list,
-                         corrected_mag_id: str = 'baseline_corrected_mag',
-                         raw_mag_id: str = 'raw_mag',
+                         flux_id: str = 'forcediffimflux_ujy',
+                         flux_unc_id: str = 'forcediffimfluxunc_ujy',
                          time_id: str = 'jd',
                          filter_id: str = 'filter',
                          ccdid_id: str = 'ccdid',
-                         field_id: str = 'field') -> None:
+                         field_id: str = 'field',
+                         qid_id: str = 'qid',
+                         zp_id: str = 'zpdiff') -> None:
         assert time_window[0] < time_window[1], \
             "Window start date is not smaller than window end date"
 
-        if corrected_mag_id not in self.df.columns:
-            self.df[corrected_mag_id] = np.nan
+        if flux_id + '_corrected' not in self.df.columns:
+            self.df[flux_id + '_corrected'] = np.nan
 
         baseline_fluxes: dict[str, list[float]] = {}
-        groups = self.df.groupby([filter_id, field_id, ccdid_id])
-        for (filt, field, ccdid), group_idx in groups.groups.items():
+        groups = self.df.groupby([filter_id, field_id, ccdid_id, qid_id])
+        for (filt, field, ccdid, qid), group_idx in groups.groups.items():
             group = self.df.loc[group_idx]
             t = group[time_id].values
             time_mask = (t >= time_window[0]) & (t <= time_window[1])
-            y_flux = self.mag2flux_ujy(self.df.loc[group_idx, raw_mag_id].values)
+            y_flux = self.df.loc[group_idx, flux_id].values
+            yerr_flux = self.df.loc[group_idx, flux_unc_id].values
             valid_in_window = y_flux[time_mask]
             valid_in_window = valid_in_window[~np.isnan(valid_in_window)]
             if len(valid_in_window) < 1:
-                print(f"Warning: no valid baseline data for {filt}, field {field}, ccdid {ccdid} — skipping")
+                print(f"Warning: no valid baseline data for {filt}, field {field}, ccdid {ccdid}, qud {qid} — skipping")
                 continue
-            baseline_flux, _ = self.calculate_baseline(y=y_flux[time_mask])
+            baseline_flux, baseline_flux_unc = self.calculate_baseline(y=y_flux[time_mask], yerr=yerr_flux[time_mask])
             y_corrected = y_flux - baseline_flux
-            self.df.loc[group_idx, corrected_mag_id] = self.flux_ujy2mag(y_corrected)
+            self.df.loc[group_idx, flux_id + '_corrected'] = y_corrected
+            self.df.loc[group_idx, flux_unc_id + '_corrected'] = np.sqrt((baseline_flux_unc)**2.0 + (yerr_flux)**2.0)
             baseline_fluxes.setdefault(filt, []).append(baseline_flux)
 
-        self._baseline_mag = {
-            filt: self.flux_ujy2mag(float(np.mean(fluxes)))
+        self._baseline_flux = {
+            filt: float(np.mean(fluxes))
             for filt, fluxes in baseline_fluxes.items()
         }
 
     def get_lc_per_filter(self,
                           filter: str,
-                          time_id: str = 'jd',
-                          mag_id: str = None,
-                          magerr_id: str = None,
-                          use_corrected: bool = True,
-                          use_err: bool = True):
-        if use_corrected and mag_id is None:
-            mag_id = 'baseline_corrected_mag'
-        elif not use_corrected and mag_id is None:
-            mag_id = 'raw_mag'
-        if use_err and magerr_id is None:
-            magerr_id = 'raw_magerr'
+                          x: str,
+                          y: str,
+                          yerr: str = None):
         filtered_df = self.get_single_filter_df(required_filter=filter)
-        if use_err:
-            return (filtered_df[time_id].values,
-                    filtered_df[mag_id].values,
-                    filtered_df[magerr_id].values)
-        return filtered_df[time_id].values, filtered_df[mag_id].values
+        if yerr is not None:
+            return (filtered_df[x].values,
+                    filtered_df[y].values,
+                    filtered_df[yerr].values)
+        return filtered_df[x].values, filtered_df[y].values
 
     def _available_filters(self, filter_id: str = 'filter') -> list[str]:
         return [f for f in VALID_FILTERS if f in self.df[filter_id].unique()]
 
     def plot_lc(self,
                 ax: plt.Axes,
-                use_corrected: bool = False,
-                time_id: str = 'jd') -> None:
-        if use_corrected and 'baseline_corrected_mag' not in self.df.columns:
-            raise ValueError("Run correct_baseline() before plotting corrected magnitudes.")
+                x_id: str = 'jd',
+                y_id: str = 'forcediffimflux_ujy',
+                yerr_id: str = 'forcediffimfluxunc_ujy',
+                zp_id: str = 'zpdiff',
+                plot_mag: bool = False,
+                use_corrected: bool = False) -> None:
+        if use_corrected:
+            y_id += '_corrected'
+            yerr_id += '_corrected'
         for filt in self._available_filters():
             style = FILTER_STYLE[filt]
-            t, m, merr = self.get_lc_per_filter(
-                filter=filt, time_id=time_id,
-                use_corrected=use_corrected, use_err=True)
-            valid = ~np.isnan(m)
-            if valid.sum() == 0:
-                continue
-            ax.errorbar(t[valid], m[valid], yerr=merr[valid],
+            x, y, yerr = self.get_lc_per_filter(
+                filter=filt, 
+                x=x_id, y=y_id, 
+                yerr=yerr_id)
+            if not plot_mag:
+                valid = ~np.isnan(y)
+                if valid.sum() == 0:
+                    continue
+                x_plot = x[valid]
+                y_plot = y[valid]
+                yerr_plot = yerr[valid]
+            else:
+                valid = np.logical_and(~np.isnan(y), y > 0.0)
+                if valid.sum() == 0:
+                    continue
+                x_plot = x[valid]
+                y_plot = self.flux_ujy2mag(y[valid])
+                yerr_plot = UNC_FACTOR * yerr[valid] / y[valid]
+            ax.errorbar(x_plot, y_plot, yerr=yerr_plot,
                         fmt='o', mec='k', color=style['color'],
                         label=style['label'], ms=4, lw=0.8,
                         capsize=2, elinewidth=0.8)
-            if use_corrected and self._baseline_mag is not None and filt in self._baseline_mag:
-                ax.axhline(self._baseline_mag[filt], color=style['color'],
-                           ls='--', lw=0.8, zorder=0, alpha=0.6)
-        ax.invert_yaxis()
-        ax.set_xlabel(f'{time_id} [days]')
-        ax.set_ylabel('Magnitude')
+            if self._baseline_flux is not None and filt in self._baseline_flux:
+                if not plot_mag:
+                    baseline_plot = self._baseline_flux[filt]
+                    ax.axhline(baseline_plot, color=style['color'],
+                            ls='--', lw=0.8, zorder=0, alpha=0.6)
+                else:
+                    baseline_plot = self.flux_ujy2mag(self._baseline_flux[filt])
+                    ax.axhline(baseline_plot, color=style['color'],
+                            ls='--', lw=0.8, zorder=0, alpha=0.6)
+        if plot_mag:
+            ax.invert_yaxis()
+        ax.set_xlabel(f'{x_id} [days]')
+        if not plot_mag:
+            ax.set_ylabel('Flux')
+        else:
+            ax.set_ylabel('AB Mag')
         ax.tick_params(which='both', direction='in', top=True, right=True)
         ax.legend()
 
-    def get_baseline_window(self, time_id: str = 'jd') -> None:
+    def get_baseline_window(self,
+                            x_id: str = 'jd',
+                            y_id: str = 'forcediffimflux_ujy',
+                            yerr_id: str = 'forcediffimfluxunc_ujy',
+                            plot_mag: bool = False) -> None:
         """Plot raw LC and let the user drag to select a pre-transient baseline window.
         Requires %matplotlib widget (ipympl). Selected range stored in self.baseline_window.
         """
         fig, ax = plt.subplots(figsize=(12, 4))
-        self.plot_lc(ax, use_corrected=False, time_id=time_id)
+        self.plot_lc(ax, x_id=x_id, y_id=y_id, yerr_id=yerr_id, plot_mag=plot_mag)
 
         _spans: list = []
         self._baseline_window = [None, None]
